@@ -1,18 +1,28 @@
-"""Lecture Notes Assistant - Part B: speech-to-text."""
+"""Lecture Notes Assistant - Parts B and C: speech-to-text + language analysis."""
 import json
 import os
+import re
 import subprocess
 import tempfile
 import threading
+import time
 import wave
 
 import azure.cognitiveservices.speech as speechsdk
+import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
 load_dotenv()
 SPEECH_KEY = os.environ["AZURE_SPEECH_KEY"]
 SPEECH_REGION = os.environ["AZURE_SPEECH_REGION"]
+LANGUAGE_KEY = os.environ["AZURE_LANGUAGE_KEY"]
+LANGUAGE_ENDPOINT = os.environ["AZURE_LANGUAGE_ENDPOINT"].rstrip("/")
+LANGUAGE_API_VERSION = "2023-04-01"
+MAX_DOC_CHARS = 5000        # Language sync API limit is 5,120 chars per document
+DOCS_PER_REQUEST = 5
+MAX_GLOSSARY_TERMS = 15
+MIN_WORDS_FOR_STUDY_PACK = 30
 LANGUAGE = "en-US"
 ALLOWED_EXT = {".wav", ".mp3", ".webm", ".ogg", ".m4a", ".aac", ".aiff", ".aif"}
 TICKS_PER_SECOND = 10_000_000  # Speech SDK offsets are in 100-ns ticks
@@ -26,6 +36,10 @@ class UnsupportedAudio(Exception):
 
 
 class SpeechServiceError(Exception):
+    pass
+
+
+class LanguageServiceError(Exception):
     pass
 
 
@@ -128,6 +142,174 @@ def run_stt(file_storage):
         "confidence": round(confidence, 3),
         "words": words,
     }
+
+
+# ---------------------------------------------------------------- Part C
+
+def chunk_text(text, max_chars=MAX_DOC_CHARS):
+    """Split a long transcript into documents under the Language size limit,
+    breaking at sentence ends where possible."""
+    chunks, current = [], ""
+    for sentence in re.split(r"(?<=[.!?])\s+", text.strip()):
+        while len(sentence) > max_chars:  # one giant unpunctuated sentence
+            cut = sentence.rfind(" ", 0, max_chars)
+            if cut <= 0:
+                cut = max_chars
+            chunks.append(sentence[:cut])
+            sentence = sentence[cut:].strip()
+        if current and len(current) + len(sentence) + 1 > max_chars:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip()
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def call_language(kind, chunks):
+    """Run one Language task over all chunks. Returns the per-document results."""
+    url = f"{LANGUAGE_ENDPOINT}/language/:analyze-text?api-version={LANGUAGE_API_VERSION}"
+    results = []
+    for start in range(0, len(chunks), DOCS_PER_REQUEST):
+        batch = chunks[start:start + DOCS_PER_REQUEST]
+        body = {
+            "kind": kind,
+            "analysisInput": {"documents": [
+                {"id": str(start + i), "language": "en", "text": t}
+                for i, t in enumerate(batch)
+            ]},
+        }
+        try:
+            r = requests.post(url, json=body, timeout=30,
+                              headers={"Ocp-Apim-Subscription-Key": LANGUAGE_KEY})
+        except requests.RequestException as e:
+            raise LanguageServiceError(f"Could not reach Azure Language: {e}")
+        if r.status_code != 200:
+            raise LanguageServiceError(f"{kind} returned {r.status_code}: {r.text[:300]}")
+        data = r.json()["results"]
+        if data.get("errors"):
+            raise LanguageServiceError(f"{kind} document error: {data['errors'][0]}")
+        results.extend(data["documents"])
+    return results
+
+
+def tokens(s):
+    return re.findall(r"[a-z0-9']+", s.lower())
+
+
+def first_mention(phrase, words):
+    """Seconds into the audio where a phrase is first spoken, or None."""
+    target = tokens(phrase)
+    spoken = [tokens(w["word"])[0] if tokens(w["word"]) else "" for w in words]
+    n = len(target)
+    for i in range(len(spoken) - n + 1):
+        if spoken[i:i + n] == target:
+            return words[i]["offset"]
+    return None
+
+
+def analyze_text(text, words=None):
+    words = words or []
+    chunks = chunk_text(text)
+    if not chunks:
+        return {"key_phrases": [], "entities": [], "glossary_candidates": []}
+
+    phrase_docs = call_language("KeyPhraseExtraction", chunks)
+    entity_docs = call_language("EntityRecognition", chunks)
+
+    # Key phrases: merge across chunks, keep first spelling, dedupe case-insensitively
+    key_phrases, seen = [], set()
+    for doc in phrase_docs:
+        for p in doc["keyPhrases"]:
+            if p.lower() not in seen:
+                seen.add(p.lower())
+                key_phrases.append(p)
+
+    # Entities: dedupe on (text, category), keep the highest confidence
+    entities = {}
+    for doc in entity_docs:
+        for e in doc["entities"]:
+            k = (e["text"].lower(), e["category"])
+            if k not in entities or e["confidenceScore"] > entities[k]["confidence"]:
+                entities[k] = {"text": e["text"], "category": e["category"],
+                               "subcategory": e.get("subcategory"),
+                               "confidence": round(e["confidenceScore"], 3)}
+    entities = list(entities.values())
+
+    # Glossary candidates: key phrases that aren't people's names,
+    # ranked by how often they're said, then by first appearance
+    people = {e["text"].lower() for e in entities if e["category"] == "Person"}
+    lowered = " " + " ".join(tokens(text)) + " "  # padded so counts match whole words
+    candidates = []
+    for order, p in enumerate(key_phrases):
+        if p.lower() in people:
+            continue
+        mentions = lowered.count(" " + " ".join(tokens(p)) + " ")
+        candidates.append({"term": p, "mentions": max(mentions, 1),
+                           "first_mention_s": first_mention(p, words), "_order": order})
+    candidates.sort(key=lambda c: (-c["mentions"], c["_order"]))
+    for c in candidates:
+        del c["_order"]
+
+    return {"key_phrases": key_phrases, "entities": entities,
+            "glossary_candidates": candidates[:MAX_GLOSSARY_TERMS]}
+
+
+@app.post("/analyze")
+def analyze():
+    body = request.get_json(silent=True) or {}
+    text = (body.get("text") or "").strip()
+    if not text:
+        return jsonify(error="Send JSON like {\"text\": \"...\"}."), 400
+    try:
+        return jsonify(analyze_text(text))
+    except LanguageServiceError as e:
+        return jsonify(error="Azure Language failed.", detail=str(e)), 502
+
+
+@app.post("/process")
+def process():
+    f = request.files.get("audio")
+    if not f or not f.filename:
+        return jsonify(error="Send the audio as a multipart field named 'audio'."), 400
+    timings = {}
+    try:
+        t0 = time.perf_counter()
+        stt = run_stt(f)
+        timings["stt"] = round((time.perf_counter() - t0) * 1000)
+
+        word_count = len(stt["transcript"].split())
+        if word_count < MIN_WORDS_FOR_STUDY_PACK:
+            return jsonify(
+                error=f"Transcript has {word_count} words; at least "
+                      f"{MIN_WORDS_FOR_STUDY_PACK} are needed for a study pack.",
+                transcript=stt["transcript"]), 422
+
+        t0 = time.perf_counter()
+        lang = analyze_text(stt["transcript"], stt["words"])
+        timings["language"] = round((time.perf_counter() - t0) * 1000)
+    except UnsupportedAudio as e:
+        return jsonify(error="Unsupported or unreadable audio format.", detail=str(e)), 415
+    except SpeechServiceError as e:
+        return jsonify(error="Azure Speech failed.", detail=str(e)), 502
+    except LanguageServiceError as e:
+        return jsonify(error="Azure Language failed.", detail=str(e)), 502
+
+    minutes = stt["duration_seconds"] / 60 or 1
+    return jsonify({
+        "segment": {"duration_seconds": stt["duration_seconds"],
+                    "language": stt["language"], "confidence": stt["confidence"]},
+        "transcript": stt["transcript"],
+        "glossary": lang["glossary_candidates"],
+        "key_phrases": lang["key_phrases"],
+        "entities": lang["entities"],
+        "notes": [],    # filled by the Foundry study-pack stage (next)
+        "quiz": [],
+        "study_pack_status": "not_implemented",
+        "key_terms_per_minute": round(len(lang["glossary_candidates"]) / minutes, 2),
+        "stage_ms": timings,
+    })
 
 
 @app.get("/health")

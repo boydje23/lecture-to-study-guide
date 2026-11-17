@@ -1,0 +1,101 @@
+{
+    "entities": [
+        {
+            "category": "DateTime",
+            "confidence": 0.99,
+            "subcategory": "Date",
+            "text": "Today"
+        },
+        {
+            "category": "Person",
+            "confidence": 1.0,
+            "subcategory": null,
+            "text": "Ivan Pavlov"
+        },
+        {
+            "category": "Product",
+            "confidence": 0.84,
+            "subcategory": null,
+            "text": "food"
+        },
+        {
+            "category": "Product",
+            "confidence": 0.9,
+            "subcategory": null,
+            "text": "bell"
+        },
+        {
+            "category": "Event",
+            "confidence": 0.76,
+            "subcategory": null,
+            "text": "extinction"
+        }
+    ],
+    "glossary": [
+        {
+            "first_mention_s": 5.23,
+            "mentions": 3,
+            "term": "bell"
+        },
+        {
+            "first_mention_s": 8.67,
+            "mentions": 3,
+            "term": "food"
+        },
+        {
+            "first_mention_s": 11.31,
+            "mentions": 2,
+            "term": "Salivation"
+        },
+        {
+            "first_mention_s": 0.83,
+            "mentions": 1,
+            "term": "classical conditioning"
+        },
+        {
+            "first_mention_s": 3.59,
+            "mentions": 1,
+            "term": "neutral stimulus"
+        },
+        {
+            "first_mention_s": 6.39,
+            "mentions": 1,
+            "term": "conditioned stimulus"
+        },
+        {
+            "first_mention_s": 12.79,
+            "mentions": 1,
+            "term": "unconditioned response"
+        },
+        {
+            "first_mention_s": 22.91,
+            "mentions": 1,
+            "term": "process"
+        }
+    ],
+    "key_phrases": [
+        "classical conditioning",
+        "Ivan Pavlov",
+        "neutral stimulus",
+        "conditioned stimulus",
+        "unconditioned response",
+        "bell",
+        "food",
+        "Salivation",
+        "process"
+    ],
+    "key_terms_per_minute": 19.51,
+    "notes": [],
+    "quiz": [],
+    "segment": {
+        "confidence": 0.786,
+        "duration_seconds": 24.6,
+        "language": "en-US"
+    },
+    "stage_ms": {
+        "language": 16050,
+        "stt": 10245
+    },
+    "study_pack_status": "not_implemented",
+    "transcript": "Today we cover classical conditioning. Ivan Pavlov showed that a neutral stimulus, like a bell, can become a conditioned stimulus after being paired with food, which is the unconditioned stimulus. Salivation to food is the unconditioned response. Once the bell alone triggers salivation, that is the conditioned response. If the bell is repeatedly presented without food, the response fades, a process called extinction."
+}
