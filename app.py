@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -14,7 +15,7 @@ from xml.sax.saxutils import escape
 import azure.cognitiveservices.speech as speechsdk
 import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 
 load_dotenv()
 SPEECH_KEY = os.environ["AZURE_SPEECH_KEY"]
@@ -33,7 +34,10 @@ LANGUAGE = "en-US"
 ALLOWED_EXT = {".wav", ".mp3", ".webm", ".ogg", ".m4a", ".aac", ".aiff", ".aif"}
 TICKS_PER_SECOND = 10_000_000  # Speech SDK offsets are in 100-ns ticks
 
-app = Flask(__name__)
+# The built React app (frontend/dist) is served from the same origin as the API,
+# so one App Service URL hosts both and the browser needs no CORS.
+FRONTEND_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")
+app = Flask(__name__, static_folder=FRONTEND_DIST, static_url_path="/")
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB
 
 
@@ -49,11 +53,24 @@ class LanguageServiceError(Exception):
     pass
 
 
+def find_ffmpeg():
+    """Prefer the static binary bundled with imageio-ffmpeg (installed by pip,
+    so App Service needs no apt-get at startup); fall back to a system ffmpeg."""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg") or "ffmpeg"
+
+
+FFMPEG = find_ffmpeg()
+
+
 def to_wav(src, dst):
     """Convert any input to 16 kHz, 16-bit, mono PCM WAV."""
     try:
         r = subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", src,
+            [FFMPEG, "-y", "-loglevel", "error", "-i", src,
              "-ac", "1", "-ar", "16000", "-sample_fmt", "s16", dst],
             capture_output=True, text=True,
         )
@@ -399,6 +416,13 @@ def process():
         "recap_error": recap_error,
         "stage_ms": timings,
     })
+
+
+@app.get("/")
+def index():
+    if not os.path.exists(os.path.join(FRONTEND_DIST, "index.html")):
+        return jsonify(error="Frontend not built. Run: cd frontend && npm run build"), 404
+    return send_from_directory(FRONTEND_DIST, "index.html")
 
 
 @app.get("/health")

@@ -3,3 +3,4 @@ python-dotenv
 requests
 azure-cognitiveservices-speech
 gunicorn
+imageio-ffmpeg
