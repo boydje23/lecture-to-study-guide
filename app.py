@@ -1,4 +1,5 @@
-"""Lecture Notes Assistant - Parts B and C: speech-to-text + language analysis."""
+"""Lecture Notes Assistant - Parts B-D: speech-to-text, language analysis, spoken recap."""
+import base64
 import json
 import os
 import re
@@ -7,6 +8,8 @@ import tempfile
 import threading
 import time
 import wave
+from concurrent.futures import ThreadPoolExecutor
+from xml.sax.saxutils import escape
 
 import azure.cognitiveservices.speech as speechsdk
 import requests
@@ -22,7 +25,10 @@ LANGUAGE_API_VERSION = "2023-04-01"
 MAX_DOC_CHARS = 5000        # Language sync API limit is 5,120 chars per document
 DOCS_PER_REQUEST = 5
 MAX_GLOSSARY_TERMS = 15
-MIN_WORDS_FOR_STUDY_PACK = 30
+MIN_WORDS_FOR_STUDY_INFO = 30
+DEFAULT_VOICE = "en-US-JennyNeural"
+VOICES = {"en-US-JennyNeural", "en-US-GuyNeural", "en-US-AriaNeural"}
+RECAP_TOP_TERMS = 5
 LANGUAGE = "en-US"
 ALLOWED_EXT = {".wav", ".mp3", ".webm", ".ogg", ".m4a", ".aac", ".aiff", ".aif"}
 TICKS_PER_SECOND = 10_000_000  # Speech SDK offsets are in 100-ns ticks
@@ -215,8 +221,11 @@ def analyze_text(text, words=None):
     if not chunks:
         return {"key_phrases": [], "entities": [], "glossary_candidates": []}
 
-    phrase_docs = call_language("KeyPhraseExtraction", chunks)
-    entity_docs = call_language("EntityRecognition", chunks)
+    # The two Language tasks are independent, so run them at the same time
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        phrase_job = pool.submit(call_language, "KeyPhraseExtraction", chunks)
+        entity_job = pool.submit(call_language, "EntityRecognition", chunks)
+        phrase_docs, entity_docs = phrase_job.result(), entity_job.result()
 
     # Key phrases: merge across chunks, keep first spelling, dedupe case-insensitively
     key_phrases, seen = [], set()
@@ -256,6 +265,66 @@ def analyze_text(text, words=None):
             "glossary_candidates": candidates[:MAX_GLOSSARY_TERMS]}
 
 
+# ---------------------------------------------------------------- Part D
+
+def build_recap(glossary, entities, quiz):
+    """Returns (plain_text, ssml_body). The plain text is shown in the UI;
+    the SSML adds pauses so a student can think before each answer."""
+    terms = [g["term"] for g in glossary[:RECAP_TOP_TERMS]]
+    parts_text, parts_ssml = [], []
+
+    if len(terms) > 1:
+        s = (f"This segment covers {len(glossary)} key terms. The main ones are "
+             f"{', '.join(terms[:-1])}, and {terms[-1]}.")
+    elif terms:
+        s = f"This segment covers one key term: {terms[0]}."
+    else:
+        s = "I didn't find any key terms in this segment."
+    parts_text.append(s)
+    parts_ssml.append(escape(s))
+
+    names = {"Person": ("person", "people"), "DateTime": ("date", "dates"),
+             "Location": ("place", "places"), "Organization": ("organization", "organizations"),
+             "Event": ("event", "events")}
+    counts = {}
+    for e in entities:
+        if e["category"] in names:
+            counts[e["category"]] = counts.get(e["category"], 0) + 1
+    if counts:
+        items = [f"{n} {names[c][0] if n == 1 else names[c][1]}" for c, n in counts.items()]
+        joined = items[0] if len(items) == 1 else ", ".join(items[:-1]) + f" and {items[-1]}"
+        s = f"It mentions {joined}."
+        parts_text.append(s)
+        parts_ssml.append(escape(s))
+
+    if quiz:
+        parts_text.append("Here are three questions to check yourself.")
+        parts_ssml.append('<break time="600ms"/>Here are three questions to check yourself.')
+        for i, q in enumerate(quiz, 1):
+            answer = q["choices"][q["answer_index"]]
+            parts_text.append(f"Question {i}: {q['question']} Answer: {answer}.")
+            parts_ssml.append(
+                f'<break time="500ms"/>Question {i}. {escape(q["question"])}'
+                f'<break time="3s"/>Answer: {escape(answer)}.')
+
+    return " ".join(parts_text), " ".join(parts_ssml)
+
+
+def synthesize(ssml_body, voice):
+    """Neural TTS to MP3 in memory. Returns base64 audio."""
+    cfg = speechsdk.SpeechConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
+    cfg.set_speech_synthesis_output_format(
+        speechsdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3)
+    synth = speechsdk.SpeechSynthesizer(speech_config=cfg, audio_config=None)
+    ssml = ('<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+            f'xml:lang="en-US"><voice name="{voice}">{ssml_body}</voice></speak>')
+    result = synth.speak_ssml_async(ssml).get()
+    if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+        details = result.cancellation_details
+        raise SpeechServiceError(f"TTS failed: {details.reason} {details.error_details}")
+    return base64.b64encode(result.audio_data).decode("ascii")
+
+
 @app.post("/analyze")
 def analyze():
     body = request.get_json(silent=True) or {}
@@ -273,6 +342,9 @@ def process():
     f = request.files.get("audio")
     if not f or not f.filename:
         return jsonify(error="Send the audio as a multipart field named 'audio'."), 400
+    voice = request.form.get("voice", DEFAULT_VOICE)
+    if voice not in VOICES:
+        return jsonify(error=f"Unknown voice. Use one of: {', '.join(sorted(VOICES))}"), 400
     timings = {}
     try:
         t0 = time.perf_counter()
@@ -280,10 +352,10 @@ def process():
         timings["stt"] = round((time.perf_counter() - t0) * 1000)
 
         word_count = len(stt["transcript"].split())
-        if word_count < MIN_WORDS_FOR_STUDY_PACK:
+        if word_count < MIN_WORDS_FOR_STUDY_INFO:
             return jsonify(
                 error=f"Transcript has {word_count} words; at least "
-                      f"{MIN_WORDS_FOR_STUDY_PACK} are needed for a study pack.",
+                      f"{MIN_WORDS_FOR_STUDY_INFO} are needed for study information.",
                 transcript=stt["transcript"]), 422
 
         t0 = time.perf_counter()
@@ -296,6 +368,18 @@ def process():
     except LanguageServiceError as e:
         return jsonify(error="Azure Language failed.", detail=str(e)), 502
 
+    notes, quiz = [], []  # filled by the Foundry study-information stage (next)
+
+    # TTS: if it fails, still return everything else instead of a 502
+    recap_text, recap_ssml = build_recap(lang["glossary_candidates"], lang["entities"], quiz)
+    recap_audio, recap_error = None, None
+    t0 = time.perf_counter()
+    try:
+        recap_audio = synthesize(recap_ssml, voice)
+    except SpeechServiceError as e:
+        recap_error = str(e)
+    timings["tts"] = round((time.perf_counter() - t0) * 1000)
+
     minutes = stt["duration_seconds"] / 60 or 1
     return jsonify({
         "segment": {"duration_seconds": stt["duration_seconds"],
@@ -304,10 +388,15 @@ def process():
         "glossary": lang["glossary_candidates"],
         "key_phrases": lang["key_phrases"],
         "entities": lang["entities"],
-        "notes": [],    # filled by the Foundry study-pack stage (next)
-        "quiz": [],
-        "study_pack_status": "not_implemented",
+        "notes": notes,
+        "quiz": quiz,
+        "study_info_status": "not_implemented",
         "key_terms_per_minute": round(len(lang["glossary_candidates"]) / minutes, 2),
+        "recap_text": recap_text,
+        "recap_voice": voice,
+        "tts_char_count": len(recap_text),
+        "recap_audio": recap_audio,
+        "recap_error": recap_error,
         "stage_ms": timings,
     })
 
