@@ -4,3 +4,4 @@ requests
 azure-cognitiveservices-speech
 gunicorn
 imageio-ffmpeg
+azure-monitor-opentelemetry

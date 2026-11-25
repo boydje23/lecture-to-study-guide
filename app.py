@@ -1,5 +1,14 @@
-"""Lecture Notes Assistant - Parts B-D: speech-to-text, language analysis, spoken recap."""
+"""Lecture Notes Assistant - Parts B-G: speech-to-text, language analysis,
+spoken recap, observability."""
+# --- Part G: telemetry must be initialized before Flask and the Azure SDKs ---
+from dotenv import load_dotenv
+load_dotenv()
+
+from telemetry import init_telemetry
+init_telemetry()
+
 import base64
+import contextvars
 import json
 import os
 import re
@@ -9,15 +18,16 @@ import tempfile
 import threading
 import time
 import wave
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from xml.sax.saxutils import escape
 
 import azure.cognitiveservices.speech as speechsdk
 import requests
-from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_from_directory
+from opentelemetry import metrics, trace
+from opentelemetry.trace import Status, StatusCode
 
-load_dotenv()
 SPEECH_KEY = os.environ["AZURE_SPEECH_KEY"]
 SPEECH_REGION = os.environ["AZURE_SPEECH_REGION"]
 LANGUAGE_KEY = os.environ["AZURE_LANGUAGE_KEY"]
@@ -39,6 +49,23 @@ TICKS_PER_SECOND = 10_000_000  # Speech SDK offsets are in 100-ns ticks
 FRONTEND_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")
 app = Flask(__name__, static_folder=FRONTEND_DIST, static_url_path="/")
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB
+
+# --- Part G: tracer, meter and metric instruments (created once) ---
+tracer = trace.get_tracer("lecture-notes")
+meter = metrics.get_meter("lecture-notes")
+M = {
+    "stt_confidence": meter.create_gauge("stt_confidence"),
+    "stt_duration_seconds": meter.create_gauge("stt_duration_seconds"),
+    "stt_word_count": meter.create_gauge("stt_word_count"),
+    "language_entity_count": meter.create_gauge("language_entity_count"),
+    "language_keyphrase_count": meter.create_gauge("language_keyphrase_count"),
+    "tts_char_count": meter.create_gauge("tts_char_count"),
+    "key_terms_per_minute": meter.create_gauge("key_terms_per_minute"),  # domain metric
+    "stage_stt_ms": meter.create_histogram("stage_stt_ms"),
+    "stage_language_ms": meter.create_histogram("stage_language_ms"),
+    "stage_tts_ms": meter.create_histogram("stage_tts_ms"),
+}
+RECENT_RUNS = deque(maxlen=50)  # backs /telemetry-summary
 
 
 class UnsupportedAudio(Exception):
@@ -239,9 +266,13 @@ def analyze_text(text, words=None):
         return {"key_phrases": [], "entities": [], "glossary_candidates": []}
 
     # The two Language tasks are independent, so run them at the same time
+    # copy_context() carries the current trace into each thread, so the two
+    # Language HTTP calls show up as children of the language_analysis span
     with ThreadPoolExecutor(max_workers=2) as pool:
-        phrase_job = pool.submit(call_language, "KeyPhraseExtraction", chunks)
-        entity_job = pool.submit(call_language, "EntityRecognition", chunks)
+        phrase_job = pool.submit(contextvars.copy_context().run,
+                                 call_language, "KeyPhraseExtraction", chunks)
+        entity_job = pool.submit(contextvars.copy_context().run,
+                                 call_language, "EntityRecognition", chunks)
         phrase_docs, entity_docs = phrase_job.result(), entity_job.result()
 
     # Key phrases: merge across chunks, keep first spelling, dedupe case-insensitively
@@ -354,6 +385,16 @@ def analyze():
         return jsonify(error="Azure Language failed.", detail=str(e)), 502
 
 
+def fail(span, status_code, payload, stage):
+    """Mark the trace as failed (G4 pipeline_error) and return the error response."""
+    span.set_attribute("pipeline.event", "pipeline_error")
+    span.set_attribute("pipeline.failed_stage", stage)
+    span.set_status(Status(StatusCode.ERROR, payload.get("error", "")))
+    if payload.get("detail"):
+        span.record_exception(Exception(payload["detail"]))
+    return jsonify(payload), status_code
+
+
 @app.post("/process")
 def process():
     f = request.files.get("audio")
@@ -362,42 +403,97 @@ def process():
     voice = request.form.get("voice", DEFAULT_VOICE)
     if voice not in VOICES:
         return jsonify(error=f"Unknown voice. Use one of: {', '.join(sorted(VOICES))}"), 400
+    audio_format = os.path.splitext(f.filename)[1].lower().lstrip(".") or "unknown"
     timings = {}
-    try:
-        t0 = time.perf_counter()
-        stt = run_stt(f)
-        timings["stt"] = round((time.perf_counter() - t0) * 1000)
 
-        word_count = len(stt["transcript"].split())
+    with tracer.start_as_current_span("pipeline.process") as root:
+        root.set_attribute("audio.format", audio_format)
+
+        # Stage 1 - Speech-to-Text
+        with tracer.start_as_current_span("stage.speech_to_text") as span:
+            t0 = time.perf_counter()
+            try:
+                stt = run_stt(f)
+            except UnsupportedAudio as e:
+                return fail(root, 415, {"error": "Unsupported or unreadable audio format.",
+                                        "detail": str(e)}, "speech_to_text")
+            except SpeechServiceError as e:
+                return fail(root, 502, {"error": "Azure Speech failed.", "detail": str(e)},
+                            "speech_to_text")
+            timings["stt"] = round((time.perf_counter() - t0) * 1000)
+            word_count = len(stt["transcript"].split())
+            span.set_attribute("stt.confidence", stt["confidence"])
+            span.set_attribute("stt.word_count", word_count)
+            span.set_attribute("stt.audio_seconds", stt["duration_seconds"])
+            span.set_attribute("duration_ms", timings["stt"])
+
         if word_count < MIN_WORDS_FOR_STUDY_INFO:
-            return jsonify(
-                error=f"Transcript has {word_count} words; at least "
-                      f"{MIN_WORDS_FOR_STUDY_INFO} are needed for study information.",
-                transcript=stt["transcript"]), 422
+            return fail(root, 422, {
+                "error": f"Transcript has {word_count} words; at least "
+                         f"{MIN_WORDS_FOR_STUDY_INFO} are needed for study information.",
+                "transcript": stt["transcript"]}, "speech_to_text")
 
-        t0 = time.perf_counter()
-        lang = analyze_text(stt["transcript"], stt["words"])
-        timings["language"] = round((time.perf_counter() - t0) * 1000)
-    except UnsupportedAudio as e:
-        return jsonify(error="Unsupported or unreadable audio format.", detail=str(e)), 415
-    except SpeechServiceError as e:
-        return jsonify(error="Azure Speech failed.", detail=str(e)), 502
-    except LanguageServiceError as e:
-        return jsonify(error="Azure Language failed.", detail=str(e)), 502
+        # Stage 2 - Language Analysis
+        with tracer.start_as_current_span("stage.language_analysis") as span:
+            t0 = time.perf_counter()
+            try:
+                lang = analyze_text(stt["transcript"], stt["words"])
+            except LanguageServiceError as e:
+                return fail(root, 502, {"error": "Azure Language failed.", "detail": str(e)},
+                            "language_analysis")
+            timings["language"] = round((time.perf_counter() - t0) * 1000)
+            span.set_attribute("language.keyphrase_count", len(lang["key_phrases"]))
+            span.set_attribute("language.entity_count", len(lang["entities"]))
+            span.set_attribute("language.glossary_count", len(lang["glossary_candidates"]))
+            span.set_attribute("duration_ms", timings["language"])
 
-    notes, quiz = [], []  # filled by the Foundry study-information stage (next)
+        notes, quiz = [], []  # filled by the Foundry study-information stage (next)
 
-    # TTS: if it fails, still return everything else instead of a 502
-    recap_text, recap_ssml = build_recap(lang["glossary_candidates"], lang["entities"], quiz)
-    recap_audio, recap_error = None, None
-    t0 = time.perf_counter()
-    try:
-        recap_audio = synthesize(recap_ssml, voice)
-    except SpeechServiceError as e:
-        recap_error = str(e)
-    timings["tts"] = round((time.perf_counter() - t0) * 1000)
+        # Stage 3 - Text-to-Speech (a failure here still returns everything else)
+        with tracer.start_as_current_span("stage.text_to_speech") as span:
+            t0 = time.perf_counter()
+            recap_text, recap_ssml = build_recap(lang["glossary_candidates"], lang["entities"], quiz)
+            recap_audio, recap_error = None, None
+            try:
+                recap_audio = synthesize(recap_ssml, voice)
+            except SpeechServiceError as e:
+                recap_error = str(e)
+                span.set_status(Status(StatusCode.ERROR, recap_error))
+            timings["tts"] = round((time.perf_counter() - t0) * 1000)
+            span.set_attribute("tts.char_count", len(recap_text))
+            span.set_attribute("tts.voice", voice)
+            span.set_attribute("duration_ms", timings["tts"])
 
-    minutes = stt["duration_seconds"] / 60 or 1
+        # Domain metric: validated key terms per minute of audio
+        minutes = stt["duration_seconds"] / 60 or 1
+        key_terms_per_minute = round(len(lang["glossary_candidates"]) / minutes, 2)
+
+        attrs = {"audio_format": audio_format, "language": stt["language"]}
+        M["stt_confidence"].set(stt["confidence"], attrs)
+        M["stt_duration_seconds"].set(stt["duration_seconds"], attrs)
+        M["stt_word_count"].set(word_count, attrs)
+        M["language_entity_count"].set(len(lang["entities"]), attrs)
+        M["language_keyphrase_count"].set(len(lang["key_phrases"]), attrs)
+        M["tts_char_count"].set(len(recap_text), attrs)
+        M["key_terms_per_minute"].set(key_terms_per_minute, attrs)
+        M["stage_stt_ms"].record(timings["stt"], attrs)
+        M["stage_language_ms"].record(timings["language"], attrs)
+        M["stage_tts_ms"].record(timings["tts"], attrs)
+
+        # G4 pipeline_completed, recorded on the request span
+        root.set_attribute("pipeline.event", "pipeline_completed")
+        root.set_attribute("key_terms_per_minute", key_terms_per_minute)
+        root.set_attribute("stt.confidence", stt["confidence"])
+
+        RECENT_RUNS.append({
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "audio_format": audio_format,
+            "audio_seconds": stt["duration_seconds"],
+            "key_terms_per_minute": key_terms_per_minute,
+            "stt_confidence": stt["confidence"],
+            "stage_ms": dict(timings),
+        })
+
     return jsonify({
         "segment": {"duration_seconds": stt["duration_seconds"],
                     "language": stt["language"], "confidence": stt["confidence"]},
@@ -408,7 +504,7 @@ def process():
         "notes": notes,
         "quiz": quiz,
         "study_info_status": "not_implemented",
-        "key_terms_per_minute": round(len(lang["glossary_candidates"]) / minutes, 2),
+        "key_terms_per_minute": key_terms_per_minute,
         "recap_text": recap_text,
         "recap_voice": voice,
         "tts_char_count": len(recap_text),
@@ -416,6 +512,23 @@ def process():
         "recap_error": recap_error,
         "stage_ms": timings,
     })
+
+
+@app.get("/telemetry-summary")
+def telemetry_summary():
+    """What this instance has emitted since it started. Use it to confirm the
+    metric code runs while Application Insights catches up (5-15 min lag)."""
+    runs = list(RECENT_RUNS)
+    if not runs:
+        return jsonify(runs=0, note="No /process calls since this instance started.")
+    avg = lambda k: round(sum(r[k] for r in runs) / len(runs), 3)
+    stage_avg = {s: round(sum(r["stage_ms"][s] for r in runs) / len(runs))
+                 for s in ("stt", "language", "tts")}
+    return jsonify(runs=len(runs),
+                   avg_key_terms_per_minute=avg("key_terms_per_minute"),
+                   avg_stt_confidence=avg("stt_confidence"),
+                   avg_stage_ms=stage_avg,
+                   recent=runs[-5:])
 
 
 @app.get("/")
